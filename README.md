@@ -156,4 +156,5 @@ deserialization, activity parsers and the JtR hash format.
 PolyForm Noncommercial 1.0.0 — see [LICENSE](LICENSE).
 
 ## Telegram
-@hackerebanatik
+[@hackerebanatik](https://t.me/hackerebanatik )
+
