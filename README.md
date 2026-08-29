@@ -75,7 +75,7 @@ Windows/macOS; on Linux install `python3-tk`).
 
 ## Usage
 
-### GUI (dark theme, progress, cancel, log)
+### GUI
 
 ```bash
 python TDataDecrypter.py
