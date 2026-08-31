@@ -7,7 +7,9 @@ import re
 import shutil
 import sqlite3
 import struct
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -59,6 +61,9 @@ STR = {
         'checksum_fail': '[!] checksum не сошёлся: {place} (всё равно сохраняю)',
         'merged_holes': '[~] {name}: склеен с пропусками ({filled}/{total} байт) — слайсы в кэше неполные',
         'merge_fail': '[!] склейка слайсов {high}... не удалась: {e}',
+        'merge_runs': '[~] {high}...: под одним ключом {n} разных медиа — сохраняю раздельно',
+        'merge_far': '[~] {name}: слайс на +{off} МБ не от этого файла — отброшен',
+        'merge_huge': '[~] {name}: куски дальше {max} МБ отброшены (больше лимита Telegram)',
         'parse_skip': '[~] разбор {name} пропущен: {e}',
         'no_headers': '[i] видео-заголовков в media_cache не найдено — склеивать нечего',
         'headers_merged': '[i] слито дублирующихся заголовков: {n}',
@@ -109,6 +114,9 @@ STR = {
         'texts_fail': '[!] тексты из {src}: {e}',
         'deep_fail': '[!] deep-медиа из {src}: {e}',
         'self_serialized': '[+] selfSerialized: {n} строк (имя/телефон/username)',
+        'account_id': '[+] Аккаунт {dir}: id = {id}',
+        'accounts_ids': '[i] Айди аккаунтов: {ids}',
+        'src_self_id': 'ПРОФИЛЬ (selfSerialized, id={id})',
         'drafts_found': '[+] найдено черновиков: {n}',
         'stats_photos': 'фото:            {n} (+{p} обрезанных)',
         'stats_videos': 'видео:           {n} (+partial см. videos/partial)',
@@ -176,6 +184,18 @@ STR = {
         'st_sugg': 'parse_search_suggestions: имя/телефон/username/rating',
         'st_john': 'john_hash: формат $telegram$2*100000*salt*key',
         'st_extractkey': 'extract_local_key на синтетике',
+        'st_johncmd': 'john_cmd: сборка командной строки JtR',
+        'st_johnfind': 'find_john: поиск исполняемого файла John',
+        'st_johnwrong': 'extract_local_key: неверный пароль даёт ошибку',
+        'st_sliceruns': 'slice_runs: чужие медиа в одной группе разделяются',
+        'st_slicemerge': 'склейка слайсов: дальние ключи не роняют сборку',
+        'st_slicerun_seq': 'slice_runs: последовательные слайсы — один файл',
+        'st_slicemerge_seq': 'склейка слайсов: слайсы по 8 МБ на свои смещения',
+        'st_slicehuge': 'склейка слайсов: куски за пределом 4 ГБ отброшены',
+        'st_selfid': 'parse_self_user_id: modern (id:long)',
+        'st_selfid_old': 'parse_self_user_id: legacy (id:int32)',
+        'st_ayusort': 'ayudata: дампы отсортированы по dialogId/messageId',
+        'st_groupsort': 'messages.txt: группы профилей по возрастанию id',
         'st_lang_tables': 'таблицы языков ru/en идентичны',
         'cli_tdata': 'путь к папке tdata (или к родителю с tdata)',
         'cli_out': 'папка вывода',
@@ -207,7 +227,7 @@ STR = {
         'btn_open': 'Открыть папку результата',
         'ready': 'Готов к запуску',
         'banner': 'расшифровка tdata.',
-        'hint': 'Укажите папку tdata и папку вывода, затем нажмите СТАРТ.',
+        'hint': 'Укажите папку tdata и папку вывода, затем нажмите СТАРТ.\nЕсли tdata под локальным паролем — жмите «Брутфорс пароля (John)».',
         'ttl_tdata': 'Выберите папку tdata',
         'ttl_out': 'Куда сохранять результат',
         'err_no_tdata': 'Нет tdata',
@@ -230,9 +250,50 @@ STR = {
         'stopped_lbl': 'Прервано / ошибка',
         'log_stopped': 'Прервано или ошибка — см. лог и report.txt',
         'ask_pass': 'Нужен пароль?',
-        'ask_pass_msg': 'Не удалось расшифровать key_datas.\n\nВозможно, в AyuGram установлен локальный пароль.\nВвести его сейчас и повторить?',
+        'ask_pass_msg': 'Не удалось расшифровать key_datas.\n\nВозможно, в AyuGram установлен локальный пароль.\nВвести его или запустить брутфорс?',
         'ask_pass_ttl': 'Локальный пароль',
         'ask_pass_lbl': 'Локальный пароль tdata:',
+        'wrong_pass_ttl': 'Неверный пароль',
+        'wrong_pass_msg': 'key_datas не расшифрован: локальный пароль неверный.\n\nВвести другой пароль или запустить брутфорс?',
+        'ask_pass_btn_retry': 'Ввести пароль',
+        'ask_pass_btn_john': 'Брутфорс',
+        'btn_john': 'Брутфорс пароля (John)',
+        'john_dlg_title': 'Брутфорс локального пароля (John the Ripper)',
+        'john_dlg_msg': 'Из key_datas извлечён хеш $telegram$2. John the Ripper переберёт пароли; найденный пароль будет проверен на этой tdata, подставлен в поле ввода, и расшифровка запустится автоматически.',
+        'john_wordlist': 'Словарь:',
+        'john_mask': 'Маска:',
+        'john_mask_hint': '?d?d?d?d — PIN из 4 цифр',
+        'john_rules': 'Правила видоизменения словаря',
+        'john_hint_masks': 'Элементы маски: ?d цифра · ?l строчная · ?u заглавная · ?a любой · ?s спецсимвол. Пустые словарь и маска — John сам прогонит свои режимы по умолчанию. Учтите: 100 000 итераций PBKDF2 на каждую попытку (4-значный PIN — минуты, 6-значный — часы).',
+        'john_start_btn': 'Запустить брутфорс',
+        'john_wl_ttl': 'Выберите файл словаря',
+        'john_nojohn': 'John the Ripper не найден',
+        'john_nojohn_msg': 'Установите John the Ripper (сборка jumbo) и повторите:\n\nWindows: скачайте с openwall.info/john и распакуйте, например, в C:\\john — john.exe найдётся автоматически (или положите рядом со скриптом: john\\run\\john.exe)\nLinux: sudo apt install john\nmacOS: brew install john\n\nНужна именно jumbo-сборка — только в ней есть формат telegram.',
+        'john_nofmt': 'Формат telegram не поддерживается',
+        'john_nofmt_msg': 'Ваша сборка John the Ripper не знает формат telegram.\nНужна jumbo-сборка: openwall.info/john',
+        'john_nohash': 'Хеш не получен',
+        'john_nohash_msg': 'key_datas/key_datass не найден или не читается — хеш $telegram$2 построить нельзя.',
+        'john_nopass': 'Пароль не нужен',
+        'john_nopass_msg': 'Эта tdata расшифровывается и без пароля — брутфорс не требуется.\n\nЗапустить расшифровку сейчас?',
+        'john_run': 'брутфорс: John the Ripper работает…',
+        'john_hash_log': 'хеш: {h}',
+        'john_cmd_log': 'команда: {cmd}',
+        'john_line': 'john: {line}',
+        'john_elapsed': '…брутфорс идёт, прошло {t} мин (кнопка «Отмена» прервёт)',
+        'john_found': 'ПАРОЛЬ НАЙДЕН: {pw}',
+        'john_ver_ok': '[+] пароль проверен на этой tdata: LocalKey расшифрован',
+        'john_ver_fail': '[!] пароль подобран, но key_datas им не расшифровывается: {msg}',
+        'john_ver_fail_ttl': 'Пароль не подошёл',
+        'john_ver_fail_msg': 'John подобрал пароль «{pw}», но key_datas им не расшифровывается (нетипичная версия tdata?).\nПопробуйте другой словарь или маску.',
+        'john_none_log': '[!] пароль не подобран — попробуйте другой словарь, правила или маску',
+        'john_none_ttl': 'Пароль не найден',
+        'john_none_msg': 'John the Ripper завершился, но пароль не подобран.\n\nПопробуйте словарь побольше, правила видоизменения или маску (например, ?d?d?d?d?d?d для 6-значного PIN).',
+        'john_stop': 'брутфорс прерван пользователем',
+        'john_autostart': 'подставляю найденный пароль и запускаю расшифровку tdata…',
+        'john_run_err': '[!] не удалось запустить John: {e}',
+        'john_exit_log': '[!] John завершился с кодом {rc} — подробности в логе выше',
+        'john_exit_ttl': 'John завершился с ошибкой',
+        'john_exit_msg': 'John the Ripper завершился с кодом {rc} — обычно это ошибка в маске или недоступный словарь.\nПодробности — в логе выше.',
         'lang_switched': 'язык интерфейса: {name}',
     },
     'en': {
@@ -275,6 +336,9 @@ STR = {
         'checksum_fail': '[!] checksum mismatch: {place} (saving anyway)',
         'merged_holes': '[~] {name}: merged with gaps ({filled}/{total} bytes) — slices in cache are incomplete',
         'merge_fail': '[!] slice merge {high}... failed: {e}',
+        'merge_runs': '[~] {high}...: {n} different media under one key — saving separately',
+        'merge_far': '[~] {name}: slice at +{off} MB is not from this file — dropped',
+        'merge_huge': '[~] {name}: chunks beyond {max} MB dropped (over Telegram size limit)',
         'parse_skip': '[~] parsing {name} skipped: {e}',
         'no_headers': '[i] no video headers found in media_cache — nothing to merge',
         'headers_merged': '[i] duplicate headers merged: {n}',
@@ -325,6 +389,9 @@ STR = {
         'texts_fail': '[!] texts from {src}: {e}',
         'deep_fail': '[!] deep media from {src}: {e}',
         'self_serialized': '[+] selfSerialized: {n} lines (name/phone/username)',
+        'account_id': '[+] Account {dir}: id = {id}',
+        'accounts_ids': '[i] Account IDs: {ids}',
+        'src_self_id': 'PROFILE (selfSerialized, id={id})',
         'drafts_found': '[+] drafts found: {n}',
         'stats_photos': 'photos:          {n} (+{p} truncated)',
         'stats_videos': 'videos:          {n} (+partial see videos/partial)',
@@ -392,6 +459,18 @@ STR = {
         'st_sugg': 'parse_search_suggestions: name/phone/username/rating',
         'st_john': 'john_hash: $telegram$2*100000*salt*key format',
         'st_extractkey': 'extract_local_key on synthetic data',
+        'st_johncmd': 'john_cmd: JtR command-line building',
+        'st_johnfind': 'find_john: locating the John executable',
+        'st_johnwrong': 'extract_local_key: wrong password raises an error',
+        'st_sliceruns': 'slice_runs: unrelated media in one group split apart',
+        'st_slicemerge': 'slice merge: distant keys do not break assembly',
+        'st_slicerun_seq': 'slice_runs: consecutive slices stay one file',
+        'st_slicemerge_seq': 'slice merge: 8 MB slices at their offsets',
+        'st_slicehuge': 'slice merge: chunks past the 4 GB limit dropped',
+        'st_selfid': 'parse_self_user_id: modern (id:long)',
+        'st_selfid_old': 'parse_self_user_id: legacy (id:int32)',
+        'st_ayusort': 'ayudata: dumps sorted by dialogId/messageId',
+        'st_groupsort': 'messages.txt: profile groups ordered by id',
         'st_lang_tables': 'ru/en language tables identical',
         'cli_tdata': 'path to the tdata folder (or its parent)',
         'cli_out': 'output folder',
@@ -423,7 +502,7 @@ STR = {
         'btn_open': 'Open result folder',
         'ready': 'Ready',
         'banner': 'tdata decryption.',
-        'hint': 'Set the tdata folder and the output folder, then press START.',
+        'hint': 'Set the tdata folder and the output folder, then press START.\nIf tdata is protected by a local password, press "Brute-force password (John)".',
         'ttl_tdata': 'Select the tdata folder',
         'ttl_out': 'Select the output folder',
         'err_no_tdata': 'No tdata',
@@ -446,9 +525,50 @@ STR = {
         'stopped_lbl': 'Cancelled / error',
         'log_stopped': 'Cancelled or failed — see the log and report.txt',
         'ask_pass': 'Password required?',
-        'ask_pass_msg': 'Failed to decrypt key_datas.\n\nA local password may be set.\nEnter it now and retry?',
+        'ask_pass_msg': 'Failed to decrypt key_datas.\n\nA local password may be set in AyuGram.\nEnter it or run brute force?',
         'ask_pass_ttl': 'Local password',
         'ask_pass_lbl': 'tdata local password:',
+        'wrong_pass_ttl': 'Wrong password',
+        'wrong_pass_msg': 'key_datas was not decrypted: the local password is wrong.\n\nEnter another password or run brute force?',
+        'ask_pass_btn_retry': 'Enter password',
+        'ask_pass_btn_john': 'Brute force',
+        'btn_john': 'Brute-force password (John)',
+        'john_dlg_title': 'Local password brute-force (John the Ripper)',
+        'john_dlg_msg': 'A $telegram$2 hash has been extracted from key_datas. John the Ripper will try candidate passwords; the found one will be verified against this tdata, inserted into the password field, and decryption will start automatically.',
+        'john_wordlist': 'Wordlist:',
+        'john_mask': 'Mask:',
+        'john_mask_hint': '?d?d?d?d — a 4-digit PIN',
+        'john_rules': 'Wordlist mangling rules',
+        'john_hint_masks': 'Mask items: ?d digit · ?l lower · ?u upper · ?a any · ?s special. Empty wordlist and mask — John runs its default attacks. Note: 100 000 PBKDF2 iterations per guess (a 4-digit PIN takes minutes, a 6-digit one hours).',
+        'john_start_btn': 'Start brute-force',
+        'john_wl_ttl': 'Choose a wordlist file',
+        'john_nojohn': 'John the Ripper not found',
+        'john_nojohn_msg': 'Install John the Ripper (jumbo build) and try again:\n\nWindows: download from openwall.info/john and unpack e.g. to C:\\john — john.exe will be found automatically (or put it next to this script: john\\run\\john.exe)\nLinux: sudo apt install john\nmacOS: brew install john\n\nThe jumbo build is required — only it has the telegram format.',
+        'john_nofmt': 'telegram format not supported',
+        'john_nofmt_msg': 'Your John the Ripper build does not know the telegram format.\nThe jumbo build is required: openwall.info/john',
+        'john_nohash': 'Could not build the hash',
+        'john_nohash_msg': 'key_datas/key_datass not found or unreadable — the $telegram$2 hash cannot be built.',
+        'john_nopass': 'No password needed',
+        'john_nopass_msg': 'This tdata decrypts without any password — brute force is not needed.\n\nStart decryption now?',
+        'john_run': 'brute force: John the Ripper is running…',
+        'john_hash_log': 'hash: {h}',
+        'john_cmd_log': 'command: {cmd}',
+        'john_line': 'john: {line}',
+        'john_elapsed': '…brute force in progress, {t} min elapsed (press Cancel to abort)',
+        'john_found': 'PASSWORD FOUND: {pw}',
+        'john_ver_ok': '[+] password verified against this tdata: LocalKey decrypted',
+        'john_ver_fail': '[!] password cracked but key_datas does not decrypt with it: {msg}',
+        'john_ver_fail_ttl': 'Password did not work',
+        'john_ver_fail_msg': 'John cracked the password "{pw}", but key_datas does not decrypt with it (unusual tdata version?).\nTry another wordlist or mask.',
+        'john_none_log': '[!] password not cracked — try another wordlist, rules or a mask',
+        'john_none_ttl': 'Password not found',
+        'john_none_msg': 'John the Ripper finished without cracking the password.\n\nTry a bigger wordlist, mangling rules or a mask (e.g. ?d?d?d?d?d?d for a 6-digit PIN).',
+        'john_stop': 'brute force aborted by user',
+        'john_autostart': 'inserting the found password and starting tdata decryption…',
+        'john_run_err': '[!] failed to run John: {e}',
+        'john_exit_log': '[!] John exited with code {rc} — see the log above',
+        'john_exit_ttl': 'John exited with an error',
+        'john_exit_msg': 'John the Ripper exited with code {rc} — usually a bad mask or an unreadable wordlist.\nSee the log above for details.',
         'lang_switched': 'interface language: {name}',
     },
 }
@@ -511,6 +631,10 @@ M32 = 0xFFFFFFFF
 
 K_PART_SIZE = 128 * 1024
 K_IN_SLICE = 8 * 1024 * 1024
+
+MAX_SLICE_GAP = 64
+MAX_SLICES_PER_FILE = 4096
+MAX_MERGE_BYTES = 4 * 1024 ** 3
 
 GOOD_BOXES = {b'ftyp', b'moov', b'mdat', b'moof', b'sidx', b'free', b'skip',
               b'wide', b'uuid', b'styp', b'ssix', b'prft', b'emsg', b'mfra', b'pdin'}
@@ -685,6 +809,77 @@ def john_hash(tdata: str):
     if len(salt) != 32 or not key_enc:
         return None
     return f'$telegram$2*100000*{salt.hex()}*{key_enc.hex()}'
+
+
+def find_john():
+    """Найти исполняемый файл John the Ripper (PATH + типичные места)."""
+    p = shutil.which('john')
+    if p:
+        return p
+    exe = 'john.exe' if sys.platform.startswith('win') else 'john'
+    base = os.path.dirname(os.path.abspath(__file__))
+    home = os.path.expanduser('~')
+    cands = [
+        os.path.join(base, 'john', 'run', exe),
+        os.path.join(base, 'run', exe),
+        os.path.join(base, exe),
+        os.path.join(home, 'john', 'run', exe),
+    ]
+    if sys.platform.startswith('win'):
+        cands.append(r'C:\john\run\john.exe')
+    for c in cands:
+        if c and os.path.isfile(c):
+            return c
+    return None
+
+
+def _no_window():
+    kw = {}
+    if sys.platform.startswith('win'):
+        kw['creationflags'] = 0x08000000  # CREATE_NO_WINDOW
+    return kw
+
+
+def john_cmd(john, pot, session, hashfile, wordlist='', mask='', rules=False):
+    """Командная строка запуска JtR для формата telegram."""
+    cmd = [john, '--format=telegram', '--pot=' + pot, '--session=' + session]
+    if mask:
+        cmd.append('--mask=' + mask)
+    elif wordlist:
+        cmd.append('--wordlist=' + wordlist)
+        if rules:
+            cmd.append('--rules')
+    cmd.append(hashfile)
+    return cmd
+
+
+def john_show(john, pot, hashfile):
+    """Взят ли уже пароль: разбор вывода `john --show`."""
+    try:
+        r = subprocess.run([john, '--pot=' + pot, '--show',
+                            '--format=telegram', hashfile],
+                           capture_output=True, text=True,
+                           encoding='utf-8', errors='replace',
+                           timeout=60, **_no_window())
+    except Exception:
+        return None
+    for line in ((r.stdout or '') + '\n' + (r.stderr or '')).splitlines():
+        m = re.match(r'^\$telegram\$2\*[^:]+:(.+)$', line.strip())
+        if m:
+            return m.group(1)
+    return None
+
+
+def john_supports_telegram(john):
+    """Умеет ли сборка JtR формат telegram (только jumbo)."""
+    try:
+        r = subprocess.run([john, '--list=formats'], capture_output=True,
+                           text=True, encoding='utf-8', errors='replace',
+                           timeout=60, **_no_window())
+    except Exception:
+        return False
+    fmts = re.split(r'[,\s]+', ((r.stdout or '') + ' ' + (r.stderr or '')))
+    return 'telegram' in fmts
 
 
 def extract_local_key(tdata: str, passcode: bytes = b''):
@@ -1125,14 +1320,16 @@ def extract_activity(acct: str, subkeys: dict, local_key: bytes):
     return result
 
 
-def write_activity(out_dir: str, activity: dict, ui):
+def write_activity(out_dir: str, activity: dict, ui, account_ids=None):
     if not activity:
         return
     act_dir = os.path.join(out_dir, 'activity')
     os.makedirs(act_dir, exist_ok=True)
     lines = []
     for acct_name, data in activity.items():
-        lines.append(tr('act_account', name=acct_name))
+        uid = (account_ids or {}).get(acct_name)
+        lines.append(tr('act_account',
+                        name=f'{acct_name} (id={uid})' if uid else acct_name))
         sugg = data.get('search_suggestions', {})
         if sugg.get('top_peers'):
             lines.append('\n' + tr('act_top'))
@@ -1309,6 +1506,20 @@ def extract_texts(data: bytes):
     return out
 
 
+def parse_self_user_id(data: bytes):
+    if not data or len(data) < 12:
+        return None
+    v32 = struct.unpack('<I', data[8:12])[0]
+    v64 = struct.unpack('<Q', data[8:16])[0] if len(data) >= 16 else 0
+    if (v64 >> 32) == 0:
+        uid = v32
+    elif v64 < (1 << 33):
+        uid = v64
+    else:
+        uid = v32
+    return uid if 0 < uid < (1 << 40) else None
+
+
 _CLEAN_BIGRAMS = set('''th he an in er re on at en nd ti es or te of ed is it al ar st to nt ng
 se as ot le ou ve co de ro io li el ma ca me hi ne ra ce ri om ur be ch ll si
 yo or ut us am et mo'''.split())
@@ -1393,6 +1604,8 @@ _SRC_NAME_MAP = {'self': 'src_self', 'settingss': 'src_settings',
 
 def source_title(tag: str) -> str:
     base = tag.split('#')[0]
+    if base.startswith('self@'):
+        return tr('src_self_id', id=base[5:])
     if base in _SRC_NAME_MAP:
         return tr(_SRC_NAME_MAP[base])
     if re.fullmatch(r'[0-9A-F]{16}', base):
@@ -1423,7 +1636,15 @@ def clean_dump(dump_path: str, out_path: str, ui):
         else:
             dropped += 1
     out = [tr('texts_title')] + tr('texts_note').split('\n') + ['=' * 64, '']
-    for tag in sorted(groups, key=lambda t: -len(groups[t])):
+    def _gkey(t):
+        if t.startswith('self@'):
+            rest = t[5:]
+            if rest.isdigit():
+                return (0, int(rest), '')
+            return (0, 1 << 62, rest)
+        return (1, -len(groups[t]), t)
+
+    for tag in sorted(groups, key=_gkey):
         out.append(tr('texts_group', title=source_title(tag), n=len(groups[tag])))
         for text in groups[tag]:
             out.append(text)
@@ -1622,7 +1843,7 @@ def dump_ayudata(tdata: str, out_dir: str, ui):
         if 'DeletedMessage' in tables:
             with open(os.path.join(ayu_dir, 'deleted_messages.txt'), 'w', encoding='utf-8') as f:
                 cur.execute("SELECT dialogId, fromId, messageId, date, text, mediaPath "
-                            "FROM DeletedMessage ORDER BY date")
+                            "FROM DeletedMessage ORDER BY dialogId, messageId")
                 for dlg, frm, mid, date, text, media in cur.fetchall():
                     rows_deleted += 1
                     f.write(f"dialog={dlg} from={frm} msg={mid} date={date}\n"
@@ -1630,7 +1851,7 @@ def dump_ayudata(tdata: str, out_dir: str, ui):
         if 'EditedMessage' in tables:
             with open(os.path.join(ayu_dir, 'edited_messages.txt'), 'w', encoding='utf-8') as f:
                 cur.execute("SELECT dialogId, fromId, messageId, date, editDate, text "
-                            "FROM EditedMessage ORDER BY messageId, editDate")
+                            "FROM EditedMessage ORDER BY dialogId, messageId, editDate")
                 for dlg, frm, mid, date, edate, text in cur.fetchall():
                     rows_edited += 1
                     f.write(f"dialog={dlg} from={frm} msg={mid} date={date} edited={edate}\n"
@@ -1720,6 +1941,91 @@ def find_place_file(root: str, place_hex14: str):
     return None
 
 
+def slice_runs(items):
+    runs, cur, base = [], [], 0
+    for it in items:
+        if cur and (it[0] - cur[-1][0] > MAX_SLICE_GAP
+                    or it[0] - base > MAX_SLICES_PER_FILE):
+            runs.append(cur)
+            cur = []
+        if not cur:
+            base = it[0]
+        cur.append(it)
+    if cur:
+        runs.append(cur)
+    return runs
+
+
+def merge_slice_run(high, run, target, ui):
+    base = run[0][0]
+    base_e = run[0][2]
+    by_low = {low for low, data, e in run}
+    parts0, rem0, complex0 = parse_slice_value(run[0][1])
+    header_case = bool(complex0 and (base + 1) not in by_low
+                       and (base + 2) in by_low)
+    stem = media_name(high, base, base_e[2])
+    chunks = {}
+    for low, data, _e in run:
+        delta = low - base
+        if delta > MAX_SLICES_PER_FILE:
+            ui.log(tr('merge_far', name=stem,
+                      off=delta * K_IN_SLICE // (1024 * 1024)), 'warn')
+            continue
+        parts, rem, was_complex = parse_slice_value(data)
+        if low == base and header_case:
+            if parts:
+                for off, b in parts:
+                    chunks[off] = b
+            if rem:
+                rparts, _, _ = parse_slice_value(rem)
+                if rparts:
+                    for off, b in rparts:
+                        chunks[off] = b
+                else:
+                    chunks[0] = rem
+        else:
+            slice_off = ((delta - 1) * K_IN_SLICE if header_case
+                         else delta * K_IN_SLICE)
+            if parts:
+                for off, b in parts:
+                    chunks[slice_off + off] = b
+            else:
+                chunks[slice_off] = data
+    if not chunks:
+        return None
+    total = max(o + len(b) for o, b in chunks.items())
+    if total > MAX_MERGE_BYTES:
+        ui.log(tr('merge_huge', name=stem,
+                  max=MAX_MERGE_BYTES // (1024 * 1024)), 'warn')
+        chunks = {o: b for o, b in chunks.items()
+                  if o + len(b) <= MAX_MERGE_BYTES}
+        if not chunks:
+            return None
+        total = max(o + len(b) for o, b in chunks.items())
+    try:
+        buf = bytearray(total)
+    except (MemoryError, OverflowError) as e:
+        ui.log(tr('merge_fail', high=f'{high:016x}', e=e), 'warn')
+        return None
+    filled = 0
+    for off, b in chunks.items():
+        buf[off:off + len(b)] = b
+        filled += len(b)
+    ext, _ = sniff_media(bytes(buf[:64]))
+    name = stem + (f'.{ext}' if ext else '')
+    with open(os.path.join(target, name), 'wb') as f:
+        f.write(buf)
+    entry = {'stem': stem, 'kind': key_kind(high),
+             'file_id': str(media_id_of(high, base)),
+             'dc': high & 0xFF,
+             'tag': TAG_NAMES.get(base_e[2], base_e[2]),
+             'size': total, 'stored': base_e[6], 'used': base_e[7],
+             'high': f'{high:016x}', 'low': f'{base:016x}',
+             'merged': True}
+    return name, total, filled, entry
+
+
+
 def process_cache_db(db_dir: str, local_key: bytes, staging_root: str, ui,
                      stats, is_media: bool, tick=None):
     saved = 0
@@ -1792,63 +2098,26 @@ def process_cache_db(db_dir: str, local_key: bytes, staging_root: str, ui,
             if tick:
                 tick()
         for high, items in slices_by_high.items():
-            try:
-                items.sort(key=lambda x: x[0])
-                base = items[0][0]
-                base_e = items[0][2]
-                by_low = {low: (data, e) for low, data, e in items}
-                parts0, rem0, complex0 = parse_slice_value(items[0][1])
-                header_case = bool(complex0 and (base + 1) not in by_low
-                                   and (base + 2) in by_low)
-                chunks = {}
-                for low, data, _e in items:
-                    delta = low - base
-                    parts, rem, was_complex = parse_slice_value(data)
-                    if low == base and header_case:
-                        if parts:
-                            for off, b in parts:
-                                chunks[off] = b
-                        if rem:
-                            rparts, _, _ = parse_slice_value(rem)
-                            if rparts:
-                                for off, b in rparts:
-                                    chunks[off] = b
-                            else:
-                                chunks[0] = rem
-                    else:
-                        slice_off = ((delta - 1) * K_IN_SLICE if header_case
-                                     else delta * K_IN_SLICE)
-                        if parts:
-                            for off, b in parts:
-                                chunks[slice_off + off] = b
-                        else:
-                            chunks[slice_off] = data
-                if not chunks:
+            items.sort(key=lambda x: x[0])
+            runs = slice_runs(items)
+            if len(runs) > 1:
+                ui.log(tr('merge_runs', high=f'{high:016x}', n=len(runs)), 'warn')
+            for run in runs:
+                try:
+                    res = merge_slice_run(high, run, target, ui)
+                except Exception as e:
+                    ui.log(tr('merge_fail', high=f'{high:016x}', e=e), 'warn')
                     continue
-                total = max(o + len(b) for o, b in chunks.items())
-                buf = bytearray(total)
-                filled = 0
-                for off, b in chunks.items():
-                    buf[off:off + len(b)] = b
-                    filled += len(b)
-                ext, _ = sniff_media(bytes(buf[:64]))
-                stem = media_name(high, base, base_e[2])
-                name = stem + (f'.{ext}' if ext else '')
-                with open(os.path.join(target, name), 'wb') as f:
-                    f.write(buf)
+                if res is None:
+                    continue
+                name, total, filled, entry = res
                 saved += 1
-                index_entries.append({'stem': stem, 'kind': key_kind(high),
-                                      'file_id': str(media_id_of(high, base)),
-                                      'dc': high & 0xFF,
-                                      'tag': TAG_NAMES.get(base_e[2], base_e[2]),
-                                      'size': total, 'stored': base_e[6], 'used': base_e[7],
-                                      'high': f'{high:016x}', 'low': f'{base:016x}',
-                                      'merged': True})
+                index_entries.append(entry)
+                if tick:
+                    tick()
                 if filled < total:
                     ui.log(tr('merged_holes', name=name, filled=filled,
                               total=total), 'warn')
-            except Exception as e:
-                ui.log(tr('merge_fail', high=f'{high:016x}', e=e), 'warn')
     return saved, index_entries
 
 
@@ -2057,7 +2326,7 @@ def rebuild_videos(mc_staging: str, videos_dir: str, partial_dir: str, ui,
     for v in videos:
         span = v['store'].span()
         end_by_boxes, boxes = walk_boxes_store(v['store'], span)
-        v['T'] = max(end_by_boxes or 0, span)
+        v['T'] = min(max(end_by_boxes or 0, span), MAX_MERGE_BYTES)
         v['boxes'] = [t.decode('latin1') for _, _, t in boxes]
         v['known'] = v['store'].known_bytes()
 
@@ -2431,6 +2700,7 @@ class TDataDecrypter:
         self.embedded_media = 0
         self.media_index = []
         self.activity = {}
+        self.account_ids = {}
         self.dedupe = make_dedupe(self.stats)
         self._stage_no = 0
         os.makedirs(self.out, exist_ok=True)
@@ -2495,22 +2765,28 @@ class TDataDecrypter:
                 errs += e
         for e in errs:
             self.log(f"[!] {e}", 'warn')
+        acct_base = os.path.basename(acct)
+        uid = parse_self_user_id(self_data) if self_data else None
+        self.account_ids[acct_base] = uid
+        self.log(tr('account_id', dir=acct_base,
+                    id=str(uid) if uid is not None else '?'),
+                 'ok' if uid is not None else 'info')
         if subkeys:
             try:
                 act = extract_activity(acct, subkeys, self.local_key)
                 if act:
-                    self.activity[os.path.basename(acct)] = act
+                    self.activity[acct_base] = act
             except Exception as e:
-                self.log(tr('activity_err', name=os.path.basename(acct), e=e),
-                         'warn')
+                self.log(tr('activity_err', name=acct_base, e=e), 'warn')
         if self_data:
             try:
                 texts = extract_texts(self_data)
             except Exception:
                 texts = []
+            stag = f'self@{uid}' if uid is not None else f'self@{acct_base}'
             with open(self.msg_path, 'a', encoding='utf-8') as f:
                 for t in texts:
-                    f.write(f'[self] {t}\n')
+                    f.write(f'[{stag}] {t}\n')
             self.text_count += len(texts)
             self.log(tr('self_serialized', n=len(texts)), 'ok')
         if drafts:
@@ -2600,6 +2876,11 @@ class TDataDecrypter:
         for fn in accounts:
             self.process_account_dir(os.path.join(self.tdata, fn))
             self.check_cancel()
+        if accounts:
+            ids_parts = [
+                str(self.account_ids[f]) if self.account_ids.get(f) is not None
+                else f'{f} (?)' for f in accounts]
+            self.log(tr('accounts_ids', ids=', '.join(ids_parts)))
         self.log(tr('texts_dumped', n=self.text_count, m=self.embedded_media))
         self._prog(0.06, 0.16, 1)
 
@@ -2745,7 +3026,7 @@ class TDataDecrypter:
             self.log(tr('index_fail', e=e), 'warn')
         if self.activity:
             try:
-                write_activity(out, self.activity, self.ui)
+                write_activity(out, self.activity, self.ui, self.account_ids)
             except Exception as e:
                 self.log(tr('activity_fail', e=e), 'warn')
         if os.path.isdir(self.staging) and not o.keep_staging:
@@ -3043,6 +3324,129 @@ def selftest():
         lk3, msg3 = extract_local_key(td)
         check('st_extractkey', lk3 == real_key)
 
+        kdf_p = create_local_key(b'1234', salt)
+        ke_p = encrypt_local(kdf_p, real_key)
+        kd_p = (b'TDF$' + struct.pack('<i', 1003008)
+                + qstr(salt) + qstr(ke_p) + qstr(ie))
+        kd_p += hashlib.md5(kd_p[8:] + struct.pack('<i', len(kd_p) - 8)
+                            + struct.pack('<i', 1003008) + b'TDF$').digest()
+        with open(os.path.join(td, 'key_datas'), 'wb') as f:
+            f.write(kd_p)
+        lk4, _msg4 = extract_local_key(td, b'1234')
+        lk5, msg5 = extract_local_key(td, b'9999')
+        lk6, msg6 = extract_local_key(td)
+        check('st_johnwrong',
+              lk4 == real_key and lk5 is None and lk6 is None
+              and tr('key_wrong_pass') in msg5
+              and tr('key_john_hint') in msg6)
+
+    check('st_johncmd',
+          john_cmd('/usr/bin/john', '/p', '/s', '/h') == [
+              '/usr/bin/john', '--format=telegram', '--pot=/p',
+              '--session=/s', '/h']
+          and john_cmd('john', 'p', 's', 'h', wordlist='w.lst',
+                       rules=True) == [
+              'john', '--format=telegram', '--pot=p', '--session=s',
+              '--wordlist=w.lst', '--rules', 'h']
+          and john_cmd('john', 'p', 's', 'h', mask='?d?d?d?d') == [
+              'john', '--format=telegram', '--pot=p', '--session=s',
+              '--mask=?d?d?d?d', 'h'])
+    jf = find_john()
+    check('st_johnfind', jf is None or os.path.isfile(jf))
+
+    class _UiStub:
+        def __init__(self):
+            self.msgs = []
+
+        def log(self, msg, level='info'):
+            self.msgs.append(msg)
+
+    def _mk_part(n):
+        return b'\xff\xff\xff\xff' + os.urandom(n)
+
+    tmpd = tempfile.mkdtemp(prefix='tdsrun_')
+    try:
+        ent = ('AB0123456789AB', 0, 0, 90, 'AB0123456789AB', 0, 1, 2)
+        lo = 15233144265675243766
+        items = [(lo, _mk_part(86), ent),
+                 (lo + (1 << 40) + 12345, _mk_part(18), ent),
+                 (lo + (1 << 40) + 12345 + (1 << 44), _mk_part(2), ent)]
+        runs = slice_runs(items)
+        check('st_sliceruns', [len(r) for r in runs] == [1, 1, 1])
+        res = [merge_slice_run(0x14A39, r, tmpd, _UiStub()) for r in runs]
+        names = sorted(os.listdir(tmpd))
+        check('st_slicemerge',
+              all(r is not None for r in res) and len(names) == 3
+              and all(n.startswith('photo_') for n in names))
+        seq = [(5, _mk_part(6), ent), (6, _mk_part(6), ent),
+               (8, _mk_part(6), ent)]
+        check('st_slicerun_seq', [len(r) for r in slice_runs(seq)] == [3])
+        r2 = merge_slice_run(0x14A39, seq, tmpd, _UiStub())
+        check('st_slicemerge_seq',
+              r2 is not None and r2[1] == 3 * K_IN_SLICE + 10 and r2[2] == 30)
+        stub = _UiStub()
+        huge = struct.pack('<I', 1) + struct.pack('<II', 0xFFFFFFFF, 4) + b'abcd'
+        r3 = merge_slice_run(0x14A39, [(7, huge, ent)], tmpd, stub)
+        check('st_slicehuge',
+              r3 is None and len(stub.msgs) == 1
+              and tr('merge_huge', name='photo_7',
+                     max=MAX_MERGE_BYTES // (1024 * 1024)) in stub.msgs[0])
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
+
+    mod = struct.pack('<II', 0x1F466157, 0) + struct.pack('<Q', 493509432)
+    mod2 = struct.pack('<II', 0x1F466157, 0) + struct.pack('<Q', 7942237000)
+    oldu = (struct.pack('<II', 0x1F466157, 0) + struct.pack('<I', 493509432)
+            + struct.pack('<I', 6) + b'Vasya')
+    check('st_selfid',
+          parse_self_user_id(mod) == 493509432
+          and parse_self_user_id(mod2) == 7942237000
+          and parse_self_user_id(b'\x00' * 8) is None)
+    check('st_selfid_old', parse_self_user_id(oldu) == 493509432)
+
+    class _UiNil:
+        def log(self, *a, **k):
+            pass
+
+    tmpa = tempfile.mkdtemp(prefix='tdayu_')
+    try:
+        adb = os.path.join(tmpa, 'ayudata.db')
+        con = sqlite3.connect(adb)
+        con.execute('CREATE TABLE DeletedMessage (dialogId INTEGER, '
+                    'fromId INTEGER, messageId INTEGER, date INTEGER, '
+                    'text TEXT, mediaPath TEXT)')
+        for row in ((1, 1, 5, 100, 'e', None), (1, 1, 2, 300, 'a', None),
+                    (2, 1, 1, 200, 'x', None)):
+            con.execute('INSERT INTO DeletedMessage VALUES (?,?,?,?,?,?)',
+                        row)
+        con.commit()
+        con.close()
+        dump_ayudata(tmpa, tmpa, _UiNil())
+        with open(os.path.join(tmpa, 'ayugram', 'deleted_messages.txt'),
+                  encoding='utf-8') as f:
+            dc = f.read()
+        check('st_ayusort',
+              0 <= dc.find('msg=2 date') < dc.find('msg=5 date')
+              < dc.find('msg=1 date'))
+    finally:
+        shutil.rmtree(tmpa, ignore_errors=True)
+
+    tmpg = tempfile.mkdtemp(prefix='tdgrp_')
+    try:
+        dp = os.path.join(tmpg, 'dump.txt')
+        with open(dp, 'w', encoding='utf-8') as f:
+            f.write('[self@300] Иван Петров\n[self@100] Пупкин Адрес\n'
+                    '[settings#1] настройка включена\n')
+        op = os.path.join(tmpg, 'messages.txt')
+        clean_dump(dp, op, None)
+        with open(op, encoding='utf-8') as f:
+            gc = f.read()
+        check('st_groupsort',
+              0 <= gc.find('id=100') < gc.find('id=300')
+              < gc.find('настройка'))
+    finally:
+        shutil.rmtree(tmpg, ignore_errors=True)
+
     def _fmt_keys(s):
         return sorted(re.findall(r'\{(\w+)\}', s))
     check('st_lang_tables', set(STR['ru']) == set(STR['en']) and all(
@@ -3210,6 +3614,9 @@ def run_gui(demo=False):
             self.root = root
             self.gui_ui = GuiUI()
             self.worker = None
+            self.john_thread = None
+            self.john_proc = None
+            self.john_cancel = False
             self.last_out = None
             self.run_started_at = None
             self._build()
@@ -3311,6 +3718,9 @@ def run_gui(demo=False):
             self.lbl_pass.pack(side='left')
             ttk.Entry(row, textvariable=self.var_pass, show='•').pack(
                 side='left', fill='x', expand=True, padx=(4, 8))
+            self.btn_john = ttk.Button(row, text=tr('btn_john'),
+                                       command=self._john_dialog, width=21)
+            self.btn_john.pack(side='left')
 
             card2 = tk.Frame(r, bg=PANEL, highlightthickness=1,
                              highlightbackground='#2c3044')
@@ -3378,17 +3788,22 @@ def run_gui(demo=False):
             self.lbl_pass.configure(text=tr('fld_pass'))
             self.btn_browse_t.configure(text=tr('browse'))
             self.btn_browse_o.configure(text=tr('browse'))
+            self.btn_john.configure(text=tr('btn_john'))
             for cb, key in self.checks:
                 cb.configure(text=tr(key))
             self.btn_start.configure(text=tr('btn_start'))
             self.btn_cancel.configure(text=tr('btn_cancel'))
             self.btn_open.configure(text=tr('btn_open'))
             self.lang_btn.configure(text=cur_lang().upper())
-            if not (self.worker and self.worker.is_alive()):
+            if not self._busy():
                 self.stage_lbl.configure(text=tr('ready'))
 
+        def _busy(self):
+            return bool((self.worker and self.worker.is_alive()) or
+                        (self.john_thread and self.john_thread.is_alive()))
+
         def _switch_lang(self):
-            if self.worker and self.worker.is_alive():
+            if self._busy():
                 return
             new = pick_lang(self.root)
             if new and new != cur_lang():
@@ -3412,7 +3827,7 @@ def run_gui(demo=False):
             if p:
                 self.var_out.set(p)
 
-        def _start(self):
+        def _start(self, clear_log=True):
             tdata = self.var_tdata.get().strip()
             out = self.var_out.get().strip()
             if not tdata or not os.path.isdir(tdata):
@@ -3433,12 +3848,14 @@ def run_gui(demo=False):
             opts.raw_dump = self.opt_raw.get()
             opts.keep_staging = self.opt_staging.get()
 
-            self.log_txt.configure(state='normal')
-            self.log_txt.delete('1.0', 'end')
-            self.log_txt.configure(state='disabled')
+            if clear_log:
+                self.log_txt.configure(state='normal')
+                self.log_txt.delete('1.0', 'end')
+                self.log_txt.configure(state='disabled')
             self.btn_start.configure(state='disabled')
             self.btn_cancel.configure(state='normal')
             self.btn_open.configure(state='disabled')
+            self.btn_john.configure(state='disabled')
             self.lang_btn.configure(state='disabled')
             self.pbar.configure(value=0)
             self.run_started_at = time.time()
@@ -3450,15 +3867,27 @@ def run_gui(demo=False):
                     app = TDataDecrypter(tdata, out, self.var_pass.get(), opts,
                                          self.gui_ui)
                     ok = app.run()
-                    self.gui_ui.q.put(('done', ok))
+                    self.gui_ui.q.put(
+                        ('done', ok, (not ok) and app.local_key is None))
                 except Exception as e:
-                    self.gui_ui.q.put(('log', 'err', tr('internal_err').format(e=e)))
-                    self.gui_ui.q.put(('done', False))
+                    self.gui_ui.q.put(
+                        ('log', 'err', tr('internal_err').format(e=e)))
+                    self.gui_ui.q.put(('done', False, False))
 
             self.worker = threading.Thread(target=worker, daemon=True)
             self.worker.start()
 
         def _cancel(self):
+            if self.john_thread and self.john_thread.is_alive():
+                self.john_cancel = True
+                self.stage_lbl.configure(text=tr('cancelling'))
+                self.btn_cancel.configure(state='disabled')
+                if self.john_proc and self.john_proc.poll() is None:
+                    try:
+                        self.john_proc.kill()
+                    except Exception:
+                        pass
+                return
             if self.worker and self.worker.is_alive():
                 self.gui_ui.cancelled = True
                 self.stage_lbl.configure(text=tr('cancelling'))
@@ -3478,10 +3907,16 @@ def run_gui(demo=False):
                     messagebox.showerror(tr('open_fail'), str(e))
 
         def _on_close(self):
-            if self.worker and self.worker.is_alive():
+            if self._busy():
                 if not messagebox.askyesno(tr('ask_exit'), tr('ask_exit_msg')):
                     return
                 self.gui_ui.cancelled = True
+                self.john_cancel = True
+                if self.john_proc and self.john_proc.poll() is None:
+                    try:
+                        self.john_proc.kill()
+                    except Exception:
+                        pass
                 self.root.after(300, self.root.destroy)
             else:
                 self.root.destroy()
@@ -3505,16 +3940,20 @@ def run_gui(demo=False):
                     elif kind == 'stage':
                         self._log(f'— {item[1]} —', 'stage')
                         self.stage_lbl.configure(text=item[1])
+                    elif kind == 'john_done':
+                        self._on_john_done(item[1], item[2],
+                                           item[3] if len(item) > 3 else None)
                     elif kind == 'done':
-                        self._on_done(item[1])
+                        self._on_done(item[1], item[2] if len(item) > 2 else False)
             except queue.Empty:
                 pass
             self.root.after(60, self._poll)
 
-        def _on_done(self, ok):
+        def _on_done(self, ok, pass_fail=False):
             self.btn_start.configure(state='normal')
             self.btn_cancel.configure(state='disabled')
             self.lang_btn.configure(state='normal')
+            self.btn_john.configure(state='normal')
             if ok:
                 self.pbar.configure(value=1.0)
                 self.stage_lbl.configure(text=tr('done_lbl'))
@@ -3541,11 +3980,306 @@ def run_gui(demo=False):
             else:
                 self.stage_lbl.configure(text=tr('stopped_lbl'))
                 self._log(tr('log_stopped'), 'warn')
-                if not self.var_pass.get():
-                    if messagebox.askyesno(tr('ask_pass'), tr('ask_pass_msg')):
-                        self.var_pass.set(messagebox.askstring(
-                            tr('ask_pass_ttl'), tr('ask_pass_lbl'), show='•') or '')
-                        self._start()
+                if pass_fail:
+                    act = self._ask_pass_fail(bool(self.var_pass.get()))
+                    if act == 'retry':
+                        pw = messagebox.askstring(
+                            tr('ask_pass_ttl'), tr('ask_pass_lbl'), show='•')
+                        if pw is not None:
+                            self.var_pass.set(pw)
+                            self._start()
+                    elif act == 'john':
+                        self._john_dialog()
+
+        def _ask_pass_fail(self, has_pass):
+            w = tk.Toplevel(self.root)
+            w.title(tr('wrong_pass_ttl') if has_pass else tr('ask_pass'))
+            w.configure(bg=BG)
+            w.resizable(False, False)
+            w.transient(self.root)
+            w.grab_set()
+            choice = {}
+
+            def go(v):
+                choice['v'] = v
+                w.destroy()
+
+            msg = tr('wrong_pass_msg') if has_pass else tr('ask_pass_msg')
+            tk.Label(w, text=msg, bg=BG, fg=FG, wraplength=440,
+                     justify='left', font=('Segoe UI', 10)).pack(
+                         padx=20, pady=(18, 14))
+            brow = tk.Frame(w, bg=BG)
+            brow.pack(padx=16, pady=(0, 18))
+            for text, v in ((tr('ask_pass_btn_retry'), 'retry'),
+                            (tr('ask_pass_btn_john'), 'john'),
+                            (tr('btn_cancel'), None)):
+                tk.Button(brow, text=text, command=lambda vv=v: go(vv),
+                          bg=PANEL2, fg=FG, activebackground=ACCENT,
+                          activeforeground='#ffffff', relief='flat',
+                          font=('Segoe UI', 9, 'bold'), padx=14, pady=6,
+                          cursor='hand2').pack(side='left', padx=6)
+            w.protocol('WM_DELETE_WINDOW', lambda: go(None))
+            self.root.wait_window(w)
+            return choice.get('v')
+
+        def _john_dialog(self):
+            if self._busy():
+                return
+            tdata = self.var_tdata.get().strip()
+            if not tdata or not os.path.isdir(tdata):
+                messagebox.showerror(tr('err_no_tdata'), tr('err_no_tdata_msg'))
+                return
+            td = locate_tdata(tdata)
+            if not td:
+                messagebox.showerror(tr('err_no_tdata'), tr('tdata_not_found'))
+                return
+            key, _msg = extract_local_key(td, b'')
+            if key is not None:
+                if messagebox.askyesno(tr('john_nopass'), tr('john_nopass_msg')):
+                    self._start()
+                return
+            jh = john_hash(td)
+            if not jh:
+                messagebox.showerror(tr('john_nohash'), tr('john_nohash_msg'))
+                return
+            john = find_john()
+            if not john:
+                messagebox.showerror(tr('john_nojohn'), tr('john_nojohn_msg'))
+                return
+            if not john_supports_telegram(john):
+                messagebox.showerror(tr('john_nofmt'), tr('john_nofmt_msg'))
+                return
+            self._john_dlg(td, jh, john)
+
+        def _john_dlg(self, td, jh, john):
+            w = tk.Toplevel(self.root)
+            w.title(tr('john_dlg_title'))
+            w.configure(bg=BG)
+            w.resizable(False, False)
+            w.transient(self.root)
+            w.grab_set()
+
+            tk.Label(w, text=tr('john_dlg_msg'), bg=BG, fg=DIM,
+                     wraplength=520, justify='left',
+                     font=('Segoe UI', 9)).pack(padx=20, pady=(16, 10))
+
+            var_wl = tk.StringVar()
+            var_mask = tk.StringVar()
+            var_rules = tk.BooleanVar(value=False)
+
+            card = tk.Frame(w, bg=PANEL)
+            card.pack(fill='x', padx=16)
+
+            row = tk.Frame(card, bg=PANEL)
+            row.pack(fill='x', padx=12, pady=(10, 0))
+            tk.Label(row, text=tr('john_wordlist'), bg=PANEL, fg=FG,
+                     width=9, anchor='w').pack(side='left')
+            ttk.Entry(row, textvariable=var_wl).pack(
+                side='left', fill='x', expand=True, padx=(4, 6))
+            ttk.Button(row, text=tr('browse'), width=8,
+                       command=lambda: var_wl.set(
+                           filedialog.askopenfilename(
+                               title=tr('john_wl_ttl')) or var_wl.get())
+                       ).pack(side='left')
+
+            row = tk.Frame(card, bg=PANEL)
+            row.pack(fill='x', padx=12, pady=(8, 0))
+            tk.Label(row, text=tr('john_mask'), bg=PANEL, fg=FG,
+                     width=9, anchor='w').pack(side='left')
+            ttk.Entry(row, textvariable=var_mask).pack(
+                side='left', fill='x', expand=True, padx=(4, 8))
+            tk.Label(row, text=tr('john_mask_hint'), bg=PANEL, fg=DIM,
+                     font=('Segoe UI', 8)).pack(side='left')
+
+            ttk.Checkbutton(card, text=tr('john_rules'),
+                            variable=var_rules).pack(
+                                anchor='w', padx=12, pady=(8, 4))
+            tk.Label(card, text=tr('john_hint_masks'), bg=PANEL, fg=DIM,
+                     wraplength=500, justify='left',
+                     font=('Segoe UI', 8)).pack(padx=12, pady=(0, 10),
+                                                fill='x')
+
+            vals = {}
+
+            def on_start():
+                vals['wl'] = var_wl.get().strip()
+                vals['mask'] = var_mask.get().strip()
+                vals['rules'] = var_rules.get()
+                w.destroy()
+
+            brow = tk.Frame(w, bg=BG)
+            brow.pack(pady=(4, 16))
+            tk.Button(brow, text=tr('john_start_btn'), command=on_start,
+                      bg=ACCENT, fg='#ffffff', activebackground='#6b9dff',
+                      activeforeground='#ffffff', relief='flat',
+                      font=('Segoe UI', 10, 'bold'), padx=18, pady=7,
+                      cursor='hand2').pack(side='left', padx=6)
+            tk.Button(brow, text=tr('btn_cancel'),
+                      command=lambda: w.destroy(), bg=PANEL2, fg=FG,
+                      activebackground='#343952', activeforeground=FG,
+                      relief='flat', font=('Segoe UI', 9, 'bold'),
+                      padx=14, pady=7, cursor='hand2').pack(side='left', padx=6)
+            w.protocol('WM_DELETE_WINDOW', w.destroy)
+            self.root.wait_window(w)
+            if vals:
+                self._john_start(td, jh, john, vals['wl'], vals['mask'],
+                                 vals['rules'])
+
+        def _john_start(self, td, jh, john, wordlist, mask, rules):
+            self.john_cancel = False
+            self.btn_start.configure(state='disabled')
+            self.btn_john.configure(state='disabled')
+            self.btn_cancel.configure(state='normal')
+            self.btn_open.configure(state='disabled')
+            self.lang_btn.configure(state='disabled')
+            self.pbar.configure(mode='indeterminate')
+            self.pbar.start(40)
+            self.stage_lbl.configure(text=tr('john_run'))
+            self.run_started_at = time.time()
+            self._log(tr('john_run'), 'stage')
+            self._log(tr('john_hash_log', h=jh), 'dim')
+
+            def worker():
+                try:
+                    self._john_worker(td, jh, john, wordlist, mask, rules)
+                except Exception as e:
+                    self.gui_ui.q.put(
+                        ('log', 'err', tr('john_run_err').format(e=e)))
+                    self.gui_ui.q.put(('john_done', None, 'exit', -1))
+
+            self.john_thread = threading.Thread(target=worker, daemon=True)
+            self.john_thread.start()
+
+        def _john_worker(self, td, jh, john, wordlist, mask, rules):
+            tmp = tempfile.mkdtemp(prefix='tdatajohn')
+            hashfile = os.path.join(tmp, 'hash.txt')
+            pot = os.path.join(tmp, 'john.pot')
+            session = os.path.join(tmp, 'session')
+            try:
+                with open(hashfile, 'w', encoding='utf-8') as f:
+                    f.write(jh + '\n')
+                open(pot, 'w', encoding='utf-8').close()
+                cmd = john_cmd(john, pot, session, hashfile, wordlist, mask,
+                               rules)
+                self.gui_ui.q.put(('log', 'dim',
+                                   tr('john_cmd_log', cmd=' '.join(cmd))))
+                try:
+                    proc = subprocess.Popen(
+                        cmd, stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, text=True,
+                        encoding='utf-8', errors='replace', cwd=tmp,
+                        **_no_window())
+                except Exception as e:
+                    self.gui_ui.q.put(
+                        ('log', 'err', tr('john_run_err').format(e=e)))
+                    self.gui_ui.q.put(('john_done', None, 'exit', -1))
+                    return
+                self.john_proc = proc
+
+                def reader():
+                    try:
+                        for line in proc.stdout:
+                            line = line.rstrip('\r\n')
+                            if line:
+                                self.gui_ui.q.put(
+                                    ('log', 'dim',
+                                     tr('john_line', line=line)))
+                    except Exception:
+                        pass
+
+                rt = threading.Thread(target=reader, daemon=True)
+                rt.start()
+
+                found = None
+                exit_rc = None
+                cancelled = False
+                started = time.time()
+                last_note = 0.0
+                while True:
+                    if self.john_cancel:
+                        cancelled = True
+                        if proc.poll() is None:
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                        break
+                    rc = proc.poll()
+                    found = john_show(john, pot, hashfile)
+                    if found:
+                        if proc.poll() is None:
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                        break
+                    if rc is not None:
+                        exit_rc = rc
+                        break
+                    now = time.time()
+                    if now - started - last_note >= 60:
+                        last_note = now - started
+                        self.gui_ui.q.put(('log', 'dim', tr(
+                            'john_elapsed', t=int(last_note) // 60)))
+                    time.sleep(1.2)
+                rt.join(timeout=3)
+                self.john_proc = None
+
+                if cancelled and not found:
+                    found = john_show(john, pot, hashfile)
+                if found:
+                    self.gui_ui.q.put(
+                        ('log', 'ok', tr('john_found', pw=found)))
+                    key, msg = extract_local_key(td, found.encode('utf-8'))
+                    if key is None:
+                        self.gui_ui.q.put(
+                            ('log', 'err', tr('john_ver_fail', msg=msg)))
+                        self.gui_ui.q.put(('john_done', found, 'verfail', None))
+                    else:
+                        self.gui_ui.q.put(('log', 'ok', tr('john_ver_ok')))
+                        self.gui_ui.q.put(('john_done', found, 'ok', None))
+                elif cancelled:
+                    self.gui_ui.q.put(('john_done', None, 'cancel', None))
+                elif exit_rc not in (None, 0):
+                    self.gui_ui.q.put(
+                        ('log', 'err', tr('john_exit_log', rc=exit_rc)))
+                    self.gui_ui.q.put(('john_done', None, 'exit', exit_rc))
+                else:
+                    self.gui_ui.q.put(('john_done', None, 'notfound', None))
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        def _on_john_done(self, pw, status, rc=None):
+            self.john_thread = None
+            try:
+                self.pbar.stop()
+            except Exception:
+                pass
+            self.pbar.configure(mode='determinate', value=0)
+            self.btn_start.configure(state='normal')
+            self.btn_john.configure(state='normal')
+            self.btn_cancel.configure(state='disabled')
+            self.lang_btn.configure(state='normal')
+            if status == 'ok':
+                self.var_pass.set(pw)
+                self._log(tr('john_autostart'), 'stage')
+                self._start(clear_log=False)
+            elif status == 'verfail':
+                self.stage_lbl.configure(text=tr('stopped_lbl'))
+                messagebox.showerror(
+                    tr('john_ver_fail_ttl'),
+                    tr('john_ver_fail_msg').format(pw=pw))
+            elif status == 'cancel':
+                self.stage_lbl.configure(text=tr('ready'))
+                self._log(tr('john_stop'), 'warn')
+            elif status == 'exit':
+                self.stage_lbl.configure(text=tr('stopped_lbl'))
+                messagebox.showerror(
+                    tr('john_exit_ttl'), tr('john_exit_msg').format(rc=rc))
+            else:
+                self.stage_lbl.configure(text=tr('ready'))
+                self._log(tr('john_none_log'), 'warn')
+                messagebox.showwarning(tr('john_none_ttl'), tr('john_none_msg'))
 
         def _log(self, msg, level='info'):
             tag = level if level in ('ok', 'warn', 'err', 'dim', 'stage') else 'info'
