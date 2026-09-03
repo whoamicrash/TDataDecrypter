@@ -1,6 +1,6 @@
 # TDataDecrypter
 
-**TDataDecrypter.py** a dependency-light forensic/recovery tool for
+**TDataDecrypter.py** self-contained a dependency-light forensic/recovery tool for
 **Telegram Desktop / AyuGram `tdata` folders**. It decrypts local storage, extracts and
 validates every recoverable media file, reconstructs sliced videos, decodes cache
 `file_id`s and usage timestamps, recovers account activity (searched peers, hashtags,
