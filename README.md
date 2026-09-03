@@ -104,7 +104,7 @@ python TDataDecrypter.py "C:/tdata" --john > hash.txt
 john --format=telegram hash.txt
 ```
 
-### Self-test (42 internal checks, no tdata needed)
+### Self-test (54 internal checks, no tdata needed)
 
 ```bash
 python TDataDecrypter.py --selftest
